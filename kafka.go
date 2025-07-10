@@ -1,16 +1,18 @@
 package main
 
 import (
-	"github.com/confluentinc/confluent-kafka-go/kafka"
-	"github.com/confluentinc/confluent-kafka-go/schemaregistry"
-	"github.com/confluentinc/confluent-kafka-go/schemaregistry/serde"
-	"github.com/confluentinc/confluent-kafka-go/schemaregistry/serde/protobuf"
+	"os"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde/protobuf"
 )
 
 func bootKafkaConsumer() (*kafka.Consumer, error) {
 	consumerCfg := kafka.ConfigMap{
-		"bootstrap.servers":        "",
-		"group.id":                 "",
+		"bootstrap.servers":        os.Getenv("KAFKA_BOOTSTRAP_SERVER"),
+		"group.id":                 os.Getenv("KAFKA_GROUP_ID"),
 		"auto.offset.reset":        "earliest",
 		"enable.auto.commit":       false,
 		"enable.auto.offset.store": false,
@@ -20,7 +22,7 @@ func bootKafkaConsumer() (*kafka.Consumer, error) {
 		return nil, err
 	}
 
-	topics := []string{""}
+	topics := []string{os.Getenv("KAFKA_TOPIC")}
 	err = consumer.SubscribeTopics(topics, nil)
 	if err != nil {
 		return nil, err
