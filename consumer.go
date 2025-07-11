@@ -9,17 +9,18 @@ import (
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde/protobuf"
 )
 
 type ConsumerHandler struct {
-	CommitAfterRetry bool
 	HandlerFunc      func(context.Context, *kafka.Message) error
+	CommitAfterRetry bool
+	AttemptsCount    int
+	AttemptsDelay    time.Duration
+	DLQProducer      *kafka.Producer
 }
 
 type KafkaConsumer struct {
 	consumer             *kafka.Consumer
-	deserializer         *protobuf.Deserializer
 	workerCount          int
 	msgQueueLen          int
 	msgQueue             chan *kafka.Message
@@ -27,9 +28,10 @@ type KafkaConsumer struct {
 	commitBatchSize      int
 	commitInterval       time.Duration
 	processedMsgCount    int
-	handlerAttemptsCount int
-	handlerAttemptsDelay time.Duration
-	pausedPartitions     map[string]struct{}
+	maxPartitionRetries  int
+	partitionBackoffBase time.Duration
+	partitionBackoffMax  time.Duration
+	pausedPartitions     map[string]*kafka.Message
 	commitTicker         *time.Ticker
 	commitMutex          sync.RWMutex
 	pauseMutex           sync.Mutex
@@ -47,9 +49,10 @@ func NewKafkaConsumer(consumer *kafka.Consumer, workerCount, messageQueueLen int
 		shutdown:             make(chan struct{}),
 		commitBatchSize:      50,
 		commitInterval:       5 * time.Second,
-		handlerAttemptsCount: 3,
-		handlerAttemptsDelay: 100 * time.Millisecond,
-		pausedPartitions:     make(map[string]struct{}),
+		pausedPartitions:     make(map[string]*kafka.Message),
+		maxPartitionRetries:  3,
+		partitionBackoffBase: 2 * time.Second,
+		partitionBackoffMax:  1 * time.Minute,
 	}
 	kc.commitTicker = time.NewTicker(kc.commitInterval)
 
@@ -139,8 +142,8 @@ func (kc *KafkaConsumer) processMessage(worker_id int, msg *kafka.Message) {
 			}
 		}()
 		resp <- Retry(
-			kc.handlerAttemptsCount,
-			kc.handlerAttemptsDelay,
+			handler.AttemptsCount,
+			handler.AttemptsDelay,
 			func(n int, err error) {
 				slog.Warn(
 					"retrying message processing", "topic_partition_offset", msg.String(), "worker_id", worker_id, "attempt", n+1, "error", err,
@@ -185,27 +188,46 @@ func (kc *KafkaConsumer) processMessage(worker_id int, msg *kafka.Message) {
 				if err != nil {
 					slog.Error("failed to seek kafka offset", "topic_partition_offset", msg.String(), "error", err)
 				}
-				kc.pausedPartitions[pausePartition] = struct{}{}
+				kc.pausedPartitions[pausePartition] = msg
 				kc.pauseMutex.Unlock()
 
 				slog.Info("pause and seek kafka", "topic_partition_offset", msg.String())
 
 				go func(tp kafka.TopicPartition, key string) {
-					backoff := time.Duration(math.Pow(2, float64(1))) * time.Millisecond // fix
-					time.Sleep(backoff)
 
 					kc.pauseMutex.Lock()
-					defer kc.pauseMutex.Unlock()
-
-					if _, exists := kc.pausedPartitions[pausePartition]; !exists {
-						slog.Info("partition already resumed by another goroutine", "topic_partition_offset", msg.String(), "backoff_time", backoff)
+					pausedMsg, exists := kc.pausedPartitions[pausePartition]
+					if !exists {
+						slog.Info("partition already resumed by another goroutine", "topic_partition_offset", pausedMsg.String())
+						kc.pauseMutex.Unlock()
 						return
 					}
+					kc.pauseMutex.Unlock()
+
+					// Create a new context for reprocessing
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+
+					backoff := kc.partitionBackoffBase
+					for attempt := range kc.maxPartitionRetries {
+						slog.Info("retrying paused message", "topic_partition_offset", pausedMsg.String(), "attempt", attempt+1, "backoff", backoff)
+						time.Sleep(backoff)
+						if err := handler.HandlerFunc(ctx, msg); err == nil {
+							slog.Info("successfully reprocessed message before resume", "topic_partition_offset", pausedMsg.String(), "attempt", attempt+1)
+							break
+						}
+						exponentialDelay := float64(kc.partitionBackoffBase) * math.Pow(2, float64(attempt))
+						backoff = time.Duration(math.Min(float64(kc.partitionBackoffMax), exponentialDelay))
+					}
+
 					err = kc.consumer.Resume([]kafka.TopicPartition{tp})
 					if err != nil {
 						slog.Error("failed to pause resume offset", "topic_partition_offset", msg.String(), "error", err)
 					}
+
+					kc.pauseMutex.Lock()
 					delete(kc.pausedPartitions, pausePartition)
+					kc.pauseMutex.Unlock()
 
 					slog.Info("resume kafka", "topic_partition_offset", msg.String(), "backoff_time", backoff)
 
@@ -234,9 +256,8 @@ func (kc *KafkaConsumer) markForCommit(msg *kafka.Message) {
 
 	// Count-based commit
 	if kc.processedMsgCount >= kc.commitBatchSize {
-		slog.Info("count-based commit triggered", "bakc._size", kc.commitBatchSize)
 		kc.commitMutex.Unlock()
-		kc.commitStoredOffsets()
+		kc.commitStoredOffsets("count-base-commit")
 
 		kc.commitTicker.Reset(kc.commitInterval)
 		return
@@ -244,7 +265,7 @@ func (kc *KafkaConsumer) markForCommit(msg *kafka.Message) {
 	kc.commitMutex.Unlock()
 }
 
-func (kc *KafkaConsumer) commitStoredOffsets() {
+func (kc *KafkaConsumer) commitStoredOffsets(trigger string) {
 	kc.commitMutex.Lock()
 	defer kc.commitMutex.Unlock()
 
@@ -257,9 +278,8 @@ func (kc *KafkaConsumer) commitStoredOffsets() {
 		slog.Error("failed to commit stored offsets", "error", err)
 		return
 	}
-
 	slog.Info(
-		"successfully committed stored offsets", "processed_msg", kc.processedMsgCount, "topic_partition_offset", info[len(info)-1].String(),
+		"successfully committed stored offsets", "trigger", trigger, "processed_msg", kc.processedMsgCount, "topic_partition_offset", info[len(info)-1].String(),
 	)
 	kc.processedMsgCount = 0
 }
@@ -270,17 +290,10 @@ func (kc *KafkaConsumer) commitRoutine() {
 	for {
 		select {
 		case <-kc.shutdown:
-			kc.commitStoredOffsets()
+			kc.commitStoredOffsets("time-base-commit")
 			return
 		case <-kc.commitTicker.C:
-			kc.commitMutex.RLock()
-			hasPendingMessages := kc.processedMsgCount > 0
-			kc.commitMutex.RUnlock()
-
-			if hasPendingMessages {
-				slog.Info("time-based commit triggered", "interval", kc.commitInterval)
-				kc.commitStoredOffsets()
-			}
+			kc.commitStoredOffsets("time-base-commit")
 		}
 	}
 }
@@ -289,7 +302,7 @@ func (kc *KafkaConsumer) Stop() {
 	close(kc.shutdown)
 	kc.wg.Wait()
 
-	kc.commitStoredOffsets()
+	kc.commitStoredOffsets("shutdown-commit")
 	if err := kc.consumer.Close(); err != nil {
 		slog.Error("closing consumer", "error", err)
 	}
