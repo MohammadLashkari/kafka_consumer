@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
@@ -19,12 +20,14 @@ func bootKafkaConsumer() (*kafka.Consumer, error) {
 	}
 	consumer, err := kafka.NewConsumer(&consumerCfg)
 	if err != nil {
+		slog.Error("failed to create new kafka consumer", "error", err)
 		return nil, err
 	}
 
 	topics := []string{os.Getenv("KAFKA_TOPIC")}
 	err = consumer.SubscribeTopics(topics, nil)
 	if err != nil {
+		slog.Error("failed to subscribe to kafka topics", "topics", topics, "error", err)
 		return nil, err
 	}
 
@@ -36,10 +39,12 @@ func bootSchemaRegistry() (*protobuf.Deserializer, error) {
 	schemaCfg.BasicAuthCredentialsSource = "URL"
 	schemaClient, err := schemaregistry.NewClient(schemaCfg)
 	if err != nil {
+		slog.Error("failed to create new schema registry client", "error", err)
 		return nil, err
 	}
 	deserializer, err := protobuf.NewDeserializer(schemaClient, serde.ValueSerde, protobuf.NewDeserializerConfig())
 	if err != nil {
+		slog.Error("failed to create new protobuf deserializer", "error", err)
 		return nil, err
 	}
 

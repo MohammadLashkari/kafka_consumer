@@ -197,21 +197,20 @@ func (kc *KafkaConsumer) processMessage(worker_id int, msg *kafka.Message) {
 
 					kc.pauseMutex.Lock()
 					pausedMsg, exists := kc.pausedPartitions[pausePartition]
+					kc.pauseMutex.Unlock()
 					if !exists {
 						slog.Info("partition already resumed by another goroutine", "topic_partition_offset", pausedMsg.String())
-						kc.pauseMutex.Unlock()
 						return
 					}
-					kc.pauseMutex.Unlock()
-
-					// Create a new context for reprocessing
-					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					defer cancel()
 
 					backoff := kc.partitionBackoffBase
 					for attempt := range kc.maxPartitionRetries {
 						slog.Info("retrying paused message", "topic_partition_offset", pausedMsg.String(), "attempt", attempt+1, "backoff", backoff)
 						time.Sleep(backoff)
+
+						ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+						defer cancel()
+
 						if err := handler.HandlerFunc(ctx, msg); err == nil {
 							slog.Info("successfully reprocessed message before resume", "topic_partition_offset", pausedMsg.String(), "attempt", attempt+1)
 							break
@@ -303,6 +302,7 @@ func (kc *KafkaConsumer) Stop() {
 	kc.wg.Wait()
 
 	kc.commitStoredOffsets("shutdown-commit")
+
 	if err := kc.consumer.Close(); err != nil {
 		slog.Error("closing consumer", "error", err)
 	}
