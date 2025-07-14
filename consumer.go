@@ -252,16 +252,12 @@ func (kc *KafkaConsumer) markForCommit(msg *kafka.Message) {
 
 	kc.commitMutex.Lock()
 	kc.processedMsgCount++
-
-	// Count-based commit
-	if kc.processedMsgCount >= kc.commitBatchSize {
-		kc.commitMutex.Unlock()
-		kc.commitStoredOffsets("count-base-commit")
-
-		kc.commitTicker.Reset(kc.commitInterval)
-		return
-	}
+	shouldCommit := kc.processedMsgCount >= kc.commitBatchSize
 	kc.commitMutex.Unlock()
+
+	if shouldCommit {
+		kc.commitStoredOffsets("count-base-commit")
+	}
 }
 
 func (kc *KafkaConsumer) commitStoredOffsets(trigger string) {
@@ -280,7 +276,11 @@ func (kc *KafkaConsumer) commitStoredOffsets(trigger string) {
 	slog.Info(
 		"successfully committed stored offsets", "trigger", trigger, "processed_msg", kc.processedMsgCount, "topic_partition_offset", info[len(info)-1].String(),
 	)
+
 	kc.processedMsgCount = 0
+	if trigger == "count-base-commit" {
+		kc.commitTicker.Reset(kc.commitInterval)
+	}
 }
 
 func (kc *KafkaConsumer) commitRoutine() {
